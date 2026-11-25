@@ -1,0 +1,160 @@
+# Node storage adapter. Native dependencies stay explicit; no global fs patch.
+crypto = require 'node:crypto'
+fs = require 'node:fs'
+path = require 'node:path'
+
+class StorageUnavailableError extends Error
+  constructor: (message, @retryAfterMs) ->
+    super message
+    @name = 'StorageUnavailableError'
+    @code = 'EAGAIN'
+
+digest = (file) -> crypto.createHash('sha256').update(fs.readFileSync(file)).digest 'hex'
+eligible = (file) ->
+  not path.resolve(file).split(path.sep).some((part) -> part in ['.database', 'node_modules', '.git']) and not /\.(?:db|sqlite|sqlite3)$/i.test(file)
+
+class StorageMesh
+  constructor: (options) ->
+    @root = path.resolve options.root
+    dataDir = options.dataDir or path.join @root, '.logos', 'storage'
+    fs.mkdirSync dataDir, {recursive: true}
+    @dataFile = path.join dataDir, 'catalog.json'
+    @provider = options.provider
+    @retryAfterMs = options.retryAfterMs ? 5000
+    @listeners = new Set()
+    try
+      @state = JSON.parse fs.readFileSync @dataFile, 'utf8'
+    catch
+      @state = {records: {}, outbox: []}
+    unless @state.records and Array.isArray @state.outbox
+      @state = {records: {}, outbox: []}
+  onEvent: (listener) ->
+    @listeners.add listener
+    => @listeners.delete listener
+  setProvider: (provider) ->
+    @provider = provider
+    return
+  status: (file) ->
+    value = @state.records[path.resolve(file)]
+    throw new Error "storage record not found: #{file}" unless value
+    {...value}
+  outbox: -> [...@state.outbox]
+  persist: ->
+    temp = "#{@dataFile}.#{process.pid}.tmp"
+    fs.writeFileSync temp, JSON.stringify @state
+    fs.renameSync temp, @dataFile
+    return
+  emit: (event, payload) ->
+    await listener event, payload for listener from @listeners
+    return
+  track: (file) ->
+    resolved = path.resolve file
+    relative = path.relative @root, resolved
+    if relative is '..' or relative.startsWith("..#{path.sep}") or path.isAbsolute relative
+      throw new Error "storage path is outside its managed root: #{file}"
+    stat = fs.statSync resolved
+    throw new Error "storage can only track files: #{file}" unless stat.isFile()
+    record = {path: resolved, key: relative.split(path.sep).join('/'), sha256: digest(resolved), size: stat.size, state: 'pending', local: true, updatedAt: new Date().toISOString()}
+    @state.records[resolved] = record
+    @state.outbox.push resolved unless @state.outbox.includes resolved
+    @persist()
+    await @emit 'storage:file-pending', {path: resolved, provider: @provider and @provider.name}
+    {...record}
+  sync: ->
+    return unless @provider
+    for file in [...@state.outbox]
+      record = @state.records[file]
+      continue unless record and record.local and fs.existsSync file
+      record.state = 'syncing'
+      @persist()
+      try
+        result = await @provider.put {key: record.key, file, sha256: record.sha256, size: record.size}
+        throw new Error 'remote digest mismatch' unless result.sha256 is record.sha256
+        record.state = 'hot'
+        delete record.lastError
+        @state.outbox = @state.outbox.filter (value) -> value isnt file
+        @persist()
+        await @emit 'storage:file-synced', {path: file, provider: @provider.name, sha256: record.sha256}
+      catch error
+        record.state = 'pending'
+        record.lastError = error.message or 'sync failed'
+        @persist()
+        await @emit 'storage:sync-failed', {path: file, provider: @provider.name, error: record.lastError}
+    return
+  freeze: (file) ->
+    resolved = path.resolve file
+    throw new Error "storage path is not eligible for freezing: #{file}" unless eligible resolved
+    record = @state.records[resolved]
+    record = await @track resolved unless record
+    throw new Error 'storage provider is not configured' unless @provider
+    await @sync()
+    record = @state.records[resolved]
+    unless record.state is 'hot'
+      record.state = 'failed'
+      @persist()
+      throw new Error record.lastError or 'remote object was not verified'
+    fs.unlinkSync resolved
+    record.local = false
+    record.state = 'frozen'
+    record.updatedAt = new Date().toISOString()
+    @persist()
+    await @emit 'storage:file-frozen', {path: resolved, provider: @provider.name, sha256: record.sha256}
+    {...record}
+  ensure: (file) ->
+    resolved = path.resolve file
+    record = @state.records[resolved]
+    throw new Error "storage record not found: #{file}" unless record
+    return {...record} if record.local and fs.existsSync resolved
+    throw new StorageUnavailableError 'storage provider is not configured', @retryAfterMs unless @provider
+    record.state = 'restoring'
+    @persist()
+    try
+      content = await @provider.get {key: record.key}
+      unless crypto.createHash('sha256').update(content).digest('hex') is record.sha256
+        throw new Error 'remote digest mismatch'
+      fs.mkdirSync path.dirname(resolved), {recursive: true}
+      temp = "#{resolved}.restoring-#{process.pid}"
+      fs.writeFileSync temp, content
+      fs.renameSync temp, resolved
+      record.local = true
+      record.state = 'hot'
+      delete record.lastError
+      record.updatedAt = new Date().toISOString()
+      @persist()
+      await @emit 'storage:file-ready', {path: resolved, provider: @provider.name}
+      {...record}
+    catch error
+      record.state = 'degraded'
+      record.lastError = error.message or 'rehydration failed'
+      @persist()
+      await @emit 'storage:rehydration-pending', {path: resolved, provider: @provider.name, retryAfterMs: @retryAfterMs}
+      throw new StorageUnavailableError "storage rehydration pending: #{record.lastError}", @retryAfterMs
+
+provideStorage = (host) ->
+  ###
+  @register module storage
+  @context capability
+  ###
+  mesh = undefined
+  name: 'storage'
+  phase: 'boot'
+  after: ['env']
+  api: {getStorage: (-> mesh), StorageMesh, StorageUnavailableError}
+  install: ->
+    config = host.storage.config()
+    root = config.root or host.dataDir() or host.workspace()
+    mesh = new StorageMesh {root, dataDir: config.dataDir, provider: config.provider, retryAfterMs: config.retryAfterMs}
+    host.state('storage').set 'mesh', mesh
+    mesh.onEvent (event, payload) -> host.emit event, payload
+    host.on 'storage:ensure', (payload) -> {...payload, storage: await mesh.ensure payload.path}
+    host.on 'storage:freeze', (payload) -> {...payload, storage: await mesh.freeze payload.path}
+    host.on 'storage:track', (payload) -> {...payload, storage: await mesh.track payload.path}
+    host.on 'storage:configure-provider', (payload) ->
+      unless payload and payload.provider and typeof payload.provider.put is 'function' and typeof payload.provider.get is 'function'
+        throw new Error 'invalid storage provider'
+      await mesh.setProvider payload.provider
+      {...payload, configured: true, provider: payload.provider.name}
+    return
+
+createHost = (args...) -> require('@thinkiac/module-runtime-compat').createHost args...
+module.exports = {provideStorage, StorageMesh, StorageUnavailableError, createHost, createRuntimeModule: provideStorage}
